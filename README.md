@@ -4,6 +4,12 @@ A community-maintained, experimental **Windhawk mod** that adds an editable to-d
 
 > **Status:** v0.4.9 source snapshot. Built and exercised on a user's Windows 11 installation in earlier iterations, but **this clean release has not yet been independently compile-tested** on a Windows/Windhawk environment. Windows updates may break Shell hooks.
 
+## Screenshots
+
+![Four-panel walkthrough, captured on a Chinese-language Windows 11 install: the empty to-do list above the calendar with holiday and makeup-workday marks on the date grid; the to-do detail form with title, date, time, location, meeting link, notes and category; the category manager with name and hex colour pickers; and a saved meeting task shown in the agenda above the calendar.](feature-overview.png)
+
+*Left to right: empty state, creating a to-do, managing categories and colours, and a saved task appearing in the calendar flyout.*
+
 ## Features
 
 - To-do tasks associated with specific calendar dates
