@@ -4,7 +4,7 @@
 // @description     Native Windows calendar todos plus China statutory holidays and makeup workdays
 // @version         0.4.9
 // @author          lonfro
-// @github          https://github.com/lonfro
+// @github          https://github.com/hokie123/native-calendar-todo
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
 // @architecture    x86-64
