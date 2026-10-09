@@ -1,0 +1,20 @@
+# Build artifacts and editors
+*.dll
+*.exe
+*.obj
+*.o
+*.pdb
+*.log
+*.tmp
+.vscode/
+.idea/
+__pycache__/
+.DS_Store
+Thumbs.db
+
+# Personal data / calendar exports
+*.ics
+*.db
+*.sqlite
+*.sqlite3
+*.bak
