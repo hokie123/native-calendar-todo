@@ -42,11 +42,10 @@ If upgrading an existing installation, **back up the current source first** and 
 
 ## Driving the list from a local AI agent
 
-When the companion service is running, it exposes the task list on the local pipe
-`\\.\pipe\LOCAL\NativeCalendarTodo.v1`. `calctl.py` speaks that protocol with nothing
-but the Python standard library, so an agent on the same machine can list, add, edit,
-complete and delete tasks — its writes show up in the flyout, and tasks the user ticks
-off are visible to it.
+With the companion service running, the task list is available on the local pipe
+`\\.\pipe\LOCAL\NativeCalendarTodo.v1`. The
+[skill package](skills/native-calendar-todo/SKILL.md) ships `calctl.py`, a
+standard-library-only client — copy the folder into the host's skills directory.
 
 ```powershell
 python skills\native-calendar-todo\scripts\calctl.py doctor
@@ -54,10 +53,8 @@ python skills\native-calendar-todo\scripts\calctl.py list --json
 python skills\native-calendar-todo\scripts\calctl.py add --title "Call grandma" --day 20261108 --time 13:15 --remind 0
 ```
 
-The client ships as a skill package in
-[`skills/native-calendar-todo/`](skills/native-calendar-todo/SKILL.md); copy that folder
-into the host's skills directory. See [`docs/AI-AGENT.md`](docs/AI-AGENT.md) for the pipe
-protocol and the full command set.
+[`docs/PIPE-PROTOCOL.md`](docs/PIPE-PROTOCOL.md) documents the wire format for other
+clients.
 
 ## Updating this project
 
