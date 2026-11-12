@@ -20,6 +20,7 @@ A community-maintained, experimental **Windhawk mod** that adds an editable to-d
   - **Holiday:** red `#B42336`
   - **Makeup workday:** blue `#0070C0`
 - In-process ICS caching and Windhawk per-mod task storage
+- Local agent access over the companion service pipe (`tools/calctl.py`)
 
 ### Not included in this version
 
@@ -38,6 +39,23 @@ A community-maintained, experimental **Windhawk mod** that adds an editable to-d
 If upgrading an existing installation, **back up the current source first** and replace it in the same mod rather than installing a second copy. The mod ID remains `win11-native-todo-calendar` to retain existing Windhawk task data. Avoid running simultaneously with the upstream Agenda mod; both may modify the same Shell controls.
 
 **Compatibility:** targets `ShellExperienceHost.exe` and `ShellHost.exe` on x64 Windows 11. This is an unofficial Windows Shell customization, not a Microsoft or Windhawk first-party product.
+
+## Driving the list from a local AI agent
+
+When the companion service is running, it exposes the task list on the local pipe
+`\\.\pipe\LOCAL\NativeCalendarTodo.v1`. `tools/calctl.py` speaks that protocol with
+nothing but the Python standard library, so an agent on the same machine can list, add,
+edit, complete and delete tasks — its writes show up in the flyout, and tasks the user
+ticks off are visible to it.
+
+```powershell
+python tools\calctl.py doctor
+python tools\calctl.py list --json
+python tools\calctl.py add --title "Call grandma" --day 20261108 --time 13:15 --remind 0
+```
+
+See [`docs/AI-AGENT.md`](docs/AI-AGENT.md) for the protocol, the full command set, and
+how to wrap the script in an agent skill.
 
 ## Updating this project
 
