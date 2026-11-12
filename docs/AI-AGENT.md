@@ -20,7 +20,7 @@ The mod never talks to a cloud service. An agent that speaks the same pipe proto
 becomes another client of the companion service, so it sees exactly what the flyout
 shows, and its writes appear in the calendar.
 
-`tools/calctl.py` is the reference client. It needs nothing but the Python standard
+`skills/native-calendar-todo/scripts/calctl.py` is the reference client. It needs nothing but the Python standard
 library and Windows.
 
 ## Prerequisites
@@ -33,7 +33,7 @@ library and Windows.
 Check the environment first — never guess:
 
 ```powershell
-python tools\calctl.py doctor
+python skills\native-calendar-todo\scripts\calctl.py doctor
 ```
 
 ```
@@ -54,15 +54,15 @@ Always prefer `--json`; the plain output is for humans.
 
 | Goal | Command |
 | --- | --- |
-| everything | `python tools\calctl.py list --json` |
-| one day | `python tools\calctl.py list --json --day 20261108` |
-| open items only | `python tools\calctl.py list --json --pending` |
-| add | `python tools\calctl.py add --title "Call grandma" --day 20261108 --time 13:15 --remind 0 --json` |
-| move / retitle | `python tools\calctl.py edit --match "Call grandma" --day 20261109 --json` |
-| complete | `python tools\calctl.py done --match "Call grandma"` |
-| reopen | `python tools\calctl.py done --match "Call grandma" --undo` |
-| delete | `python tools\calctl.py rm --match "Call grandma"` |
-| health check | `python tools\calctl.py doctor --json` |
+| everything | `python skills\native-calendar-todo\scripts\calctl.py list --json` |
+| one day | `python skills\native-calendar-todo\scripts\calctl.py list --json --day 20261108` |
+| open items only | `python skills\native-calendar-todo\scripts\calctl.py list --json --pending` |
+| add | `python skills\native-calendar-todo\scripts\calctl.py add --title "Call grandma" --day 20261108 --time 13:15 --remind 0 --json` |
+| move / retitle | `python skills\native-calendar-todo\scripts\calctl.py edit --match "Call grandma" --day 20261109 --json` |
+| complete | `python skills\native-calendar-todo\scripts\calctl.py done --match "Call grandma"` |
+| reopen | `python skills\native-calendar-todo\scripts\calctl.py done --match "Call grandma" --undo` |
+| delete | `python skills\native-calendar-todo\scripts\calctl.py rm --match "Call grandma"` |
+| health check | `python skills\native-calendar-todo\scripts\calctl.py doctor --json` |
 
 `--match` takes a unique substring of the title and fails unless exactly one task
 matches, which is what an agent should use when it does not already hold the ID.
@@ -99,14 +99,20 @@ The mod also keeps a fallback copy under
 write keep both sides identical — `calctl.py` does this best-effort and ignores a
 missing key.
 
-## Writing an agent skill around this
+## The bundled skill
 
-A skill for Claude Code, Codex or any similar tool only needs:
+[`skills/native-calendar-todo/`](../skills/native-calendar-todo/SKILL.md) is a ready-made
+skill package: `SKILL.md` carries the instructions and guards, `scripts/calctl.py` is the
+client. Copy that folder into the host's skills directory, for example
+`~/.claude/skills/native-calendar-todo/` for Claude Code, and reference it from
+`AGENTS.md` for Codex-style hosts.
+
+If you write your own, it only needs:
 
 1. a precondition step that runs `calctl.py doctor` and stops if it is not ready;
 2. the command table above;
-3. the rule that dates are absolute `YYYYMMDD` and that a task must never be created
-   for today unless the user asked for today.
+3. the rule that dates are absolute `YYYYMMDD` and that a task is not created for today
+   unless the user asked for today.
 
 The script is self-contained, so a skill can ship it as-is and call it with the
 interpreter the host already has.
