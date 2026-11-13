@@ -112,20 +112,18 @@ function Find-Python {
     }
 
     $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
-    foreach ($base in @(
-        "$env:LOCALAPPDATA\Programs\Python",
-        "$env:ProgramFiles",
-        $pf86
-    )) {
-        if (-not $base -or -not (Test-Path $base)) {
-            continue
-        }
+    $patterns = @(
+        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe",
+        "$env:ProgramFiles\Python*\python.exe"
+    )
+    if ($pf86) {
+        $patterns += (Join-Path $pf86 "Python*\python.exe")
+    }
+    foreach ($pattern in $patterns) {
         try {
-            Get-ChildItem -Path $base -Filter "python.exe" -File -Recurse -ErrorAction SilentlyContinue |
-                Select-Object -First 5 |
-                ForEach-Object {
-                    $items += [pscustomobject]@{ path = $_.FullName; launcher = $false }
-                }
+            Get-Item -Path $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+                $items += [pscustomobject]@{ path = $_.FullName; launcher = $false }
+            }
         } catch {}
     }
 
@@ -409,8 +407,15 @@ function Invoke-Calctl([pscustomobject]$Python, [string[]]$Arguments) {
         }
         $argsList += $Calctl
         $argsList += $Arguments
+        $quotedArgs = $argsList | ForEach-Object {
+            if ($_ -match '[\s"]') {
+                '"' + ($_ -replace '"', '\"') + '"'
+            } else {
+                $_
+            }
+        }
 
-        $proc = Start-Process -FilePath $Python.path -ArgumentList $argsList -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+        $proc = Start-Process -FilePath $Python.path -ArgumentList $quotedArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
         return [pscustomobject]@{
             exit_code = $proc.ExitCode
             stdout = (Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue)
