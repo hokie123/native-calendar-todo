@@ -1,409 +1,211 @@
 #!/usr/bin/env python3
-"""calctl -- command-line bridge from local AI tools to the Windows 11 calendar to-do list.
-
-The calendar to-do list is drawn by the Windhawk mod (native-calendar-todo.wh.cpp) and
-persisted by its companion service (NativeCalendarTodo.Service.exe). This script speaks
-the same local named pipe the mod uses, so an agent can list, add, edit, complete and
-delete tasks without touching the Shell UI.
-
-Only the Python standard library is required. Windows only.
-
-Quick start:
-    python calctl.py doctor
-    python calctl.py list
-    python calctl.py add --title "Call grandma" --day 20261108 --time 13:15 --remind 0
-
-Machine-readable output (for agents):
-    python calctl.py list --json
-"""
-
+"""Native Calendar Todo CLI for local AI agents. Windows 11 only; stdlib only."""
 from __future__ import annotations
+import argparse, datetime as dt, json, os, platform, re, sys
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
-import argparse
-import ctypes
-import datetime
-import json
-import os
-import re
-import struct
-import sys
-import uuid
-from ctypes import wintypes
+ROOT=r"SOFTWARE\Windhawk\Engine\ModsWritable"
+MODS=("local@win11-native-todo-calendar","win11-native-todo-calendar")
+TASKS="todo-tasks-v2"; OLD="todo-tasks-v1"; CATS="todo-categories-v2"
+DEFAULT_CATS=[{"id":"work","name":"工作","hex":"#2563EB"},{"id":"important","name":"重要","hex":"#EA580C"},{"id":"personal","name":"个人","hex":"#059669"}]
 
-DEFAULT_PIPE = r"LOCAL\NativeCalendarTodo.v1"
-DEFAULT_SHADOW_KEY = (
-    r"SOFTWARE\Windhawk\Engine\ModsWritable"
-    r"\local@win11-native-todo-calendar\LocalStorage"
-)
-SHADOW_VALUE = "todo-tasks-v3"
-PENDING_VALUE = "todo-pending-sync-v1"
+class E(RuntimeError): pass
 
-PIPE_NAME = os.environ.get("CALCTL_PIPE", DEFAULT_PIPE)
-SHADOW_KEY = os.environ.get("CALCTL_SHADOW_KEY", DEFAULT_SHADOW_KEY)
+def acc(x): return x | (getattr(winreg,"KEY_WOW64_64KEY",0) if winreg else 0)
+def path(mid): return ROOT+"\\"+mid+"\\LocalStorage"
 
-
-# --------------------------------------------------------------------------- pipe
-class PipeError(RuntimeError):
-    pass
-
-
-def _request(text: str, timeout_ms: int = 5000) -> str:
-    """Send one request over the service pipe and return the raw reply (``OK\\n...``)."""
-    path = "\\\\.\\pipe\\" + PIPE_NAME
-    GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING = 0x80000000, 0x40000000, 3
-    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
-    k32.WaitNamedPipeW.restype = wintypes.BOOL
-    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
-                                wintypes.HANDLE]
-    k32.CreateFileW.restype = wintypes.HANDLE
-    k32.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-                             ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-    k32.ReadFile.restype = wintypes.BOOL
-    k32.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
-                              ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-    k32.WriteFile.restype = wintypes.BOOL
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-    if not k32.WaitNamedPipeW(path, timeout_ms):
-        raise PipeError("pipe not available (is NativeCalendarTodo.Service.exe running?)")
-    handle = k32.CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, None,
-                             OPEN_EXISTING, 0, None)
-    if handle == INVALID_HANDLE_VALUE:
-        raise PipeError("cannot open pipe (error %d)" % ctypes.get_last_error())
+def candidates():
+    out=[]; env=os.getenv("CALCTL_MOD_ID","").strip()
+    if env: out.append(env)
+    out += [x for x in MODS if x not in out]
+    if not winreg: return out
     try:
-        payload = text.encode("utf-8")
-        written = wintypes.DWORD(0)
-        if not k32.WriteFile(handle, struct.pack("<I", len(payload)), 4,
-                             ctypes.byref(written), None):
-            raise PipeError("write failed (error %d)" % ctypes.get_last_error())
-        if payload and not k32.WriteFile(handle, payload, len(payload),
-                                         ctypes.byref(written), None):
-            raise PipeError("write failed (error %d)" % ctypes.get_last_error())
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,ROOT,0,acc(winreg.KEY_READ)) as k:
+            i=0
+            while True:
+                try: n=winreg.EnumKey(k,i); i+=1
+                except OSError: break
+                if n.endswith("win11-native-todo-calendar") and n not in out: out.append(n)
+    except OSError: pass
+    return out
 
-        buf = ctypes.create_string_buffer(4)
-        read = wintypes.DWORD(0)
-        if not k32.ReadFile(handle, buf, 4, ctypes.byref(read), None):
-            raise PipeError("read failed (error %d)" % ctypes.get_last_error())
-        (size,) = struct.unpack("<I", buf.raw)
-        if size > 4 * 1024 * 1024:
-            raise PipeError("reply too large")
-        out = ctypes.create_string_buffer(size) if size else ctypes.create_string_buffer(1)
-        got = wintypes.DWORD(0)
-        if size and not k32.ReadFile(handle, out, size, ctypes.byref(got), None):
-            raise PipeError("read failed (error %d)" % ctypes.get_last_error())
-        return out.raw[:size].decode("utf-8")
-    finally:
-        k32.CloseHandle(handle)
+def mod(write=False):
+    if platform.system()!="Windows" or not winreg: raise E("仅支持 Windows 11")
+    mode=winreg.KEY_READ | (winreg.KEY_SET_VALUE if write else 0)
+    for mid in candidates():
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,path(mid),0,acc(mode)): return mid
+        except PermissionError:
+            if write: raise E("已找到 Windhawk 存储，但没有写权限；请允许宿主提升权限后重试")
+        except OSError: pass
+    raise E("未找到 Native Calendar Todo 的 Windhawk 本地存储；请先安装并启用该 mod，或设置 CALCTL_MOD_ID")
 
+def get(mid,name):
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,path(mid),0,acc(winreg.KEY_READ)) as k:
+            v,t=winreg.QueryValueEx(k,name)
+            if t not in (winreg.REG_SZ,winreg.REG_EXPAND_SZ): raise E(f"{name} 不是字符串值")
+            return str(v)
+    except FileNotFoundError: return None
 
-# -------------------------------------------------------------------------- codec
-def _esc(value: str) -> str:
-    return (value.replace("%", "%25").replace("\t", "%09")
-                 .replace("\n", "%0A").replace("\r", "%0D"))
+def put(mid,name,value):
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,path(mid),0,acc(winreg.KEY_READ|winreg.KEY_SET_VALUE)) as k:
+            winreg.SetValueEx(k,name,0,winreg.REG_SZ,value)
+    except PermissionError as ex: raise E("没有写入 Windhawk 本地存储的权限") from ex
 
-
-def _unesc(value: str) -> str:
-    table = {"25": "%", "09": "\t", "0A": "\n", "0D": "\r"}
-    out, i = [], 0
-    while i < len(value):
-        if value[i] == "%" and i + 2 < len(value):
-            hit = table.get(value[i + 1:i + 3].upper())
-            if hit is not None:
-                out.append(hit)
-                i += 3
-                continue
-        out.append(value[i])
-        i += 1
+def esc(s): return str(s).replace("%","%25").replace("\t","%09").replace("\n","%0A").replace("\r","%0D")
+def unesc(s):
+    d={"25":"%","09":"\t","0A":"\n","0D":"\r"}; out=[]; i=0
+    while i<len(s):
+        h=d.get(s[i+1:i+3].upper()) if s[i:i+1]=="%" and i+2<len(s) else None
+        if h is not None: out.append(h); i+=3
+        else: out.append(s[i]); i+=1
     return "".join(out)
 
+def parse2(raw):
+    if not raw.startswith("#v2\n"): raise E("todo-tasks-v2 格式异常，为避免损坏数据已停止操作")
+    out=[]
+    for line in raw[4:].splitlines():
+        c=[unesc(x) for x in line.split("\t")]
+        if len(c)==8 and re.fullmatch(r"\d{8}",c[0]) and c[3]:
+            out.append(dict(day=c[0],done=c[1]=="1",category=c[2] or "work",title=c[3],time=c[4],location=c[5],url=c[6],notes=c[7]))
+    return out
 
-def _parse(reply: str) -> list[dict]:
-    if not reply.startswith("OK\n"):
-        raise PipeError("unexpected reply: %r" % reply[:80])
-    body = reply[3:]
-    if not body.startswith("#v3\n"):
-        raise PipeError("unexpected payload header")
-    tasks = []
-    for line in body[4:].split("\n"):
-        if not line:
-            continue
-        col = line.split("\t")
-        if len(col) != 14 or not col[0] or len(col[1]) != 8 or not col[4]:
-            continue
-        tasks.append({
-            "id": _unesc(col[0]),
-            "day": col[1],
-            "done": col[2] == "1",
-            "category": _unesc(col[3]),
-            "title": _unesc(col[4]),
-            "time": _unesc(col[5]),
-            "location": _unesc(col[6]),
-            "url": _unesc(col[7]),
-            "notes": _unesc(col[8]),
-            "remind": int(col[9]) if col[9] else -1,
-            "tz": col[10],
-            "provider": col[11],
-        })
-    return tasks
+def parse1(raw):
+    out=[]
+    for line in raw.splitlines():
+        c=[unesc(x) for x in line.split("\t")]
+        if len(c)==4 and re.fullmatch(r"\d{8}",c[0]) and c[3]:
+            cat="important" if c[2]=="1" else "personal" if c[2]=="2" else "work"
+            out.append(dict(day=c[0],done=c[1]=="1",category=cat,title=c[3],time="",location="",url="",notes=""))
+    return out
 
-
-def _serialize(tasks: list[dict]) -> str:
-    rows = ["#v3"]
+def dump(tasks):
+    rows=["#v2"]
     for t in tasks:
-        rows.append("\t".join([
-            _esc(t["id"]), t["day"], "1" if t["done"] else "0",
-            _esc(t.get("category") or "work"), _esc(t["title"]),
-            _esc(t.get("time") or ""), _esc(t.get("location") or ""),
-            _esc(t.get("url") or ""), _esc(t.get("notes") or ""),
-            str(t["remind"]) if t.get("remind", -1) >= 0 else "",
-            t.get("tz") or "", t.get("provider") or "local", "", "",
-        ]))
-    return "\n".join(rows) + "\n"
+        rows.append("\t".join([esc(t["day"]),"1" if t["done"] else "0",esc(t["category"]),esc(t["title"]),esc(t.get("time","")),esc(t.get("location","")),esc(t.get("url","")),esc(t.get("notes",""))]))
+    raw="\n".join(rows)+"\n"
+    if len(raw.encode("utf-16-le"))//2>=65535: raise E("待办数据达到 Windhawk 当前存储上限")
+    return raw
 
+def load(mid=None):
+    mid=mid or mod(); raw=get(mid,TASKS)
+    if raw is not None: return mid,parse2(raw),raw
+    old=get(mid,OLD); return mid,(parse1(old) if old else []),None
 
-# ----------------------------------------------------------------------- storage
-def load() -> list[dict]:
-    return _parse(_request("LIST"))
+def save(mid,tasks,expected):
+    if get(mid,TASKS)!=expected: raise E("待办列表在操作期间发生变化；请重新读取后再试")
+    payload=dump(tasks); put(mid,TASKS,payload)
+    if get(mid,TASKS)!=payload: raise E("写入后校验失败")
 
+def day(s):
+    if not re.fullmatch(r"\d{8}",s or ""): raise E("日期必须是 YYYYMMDD")
+    try: dt.datetime.strptime(s,"%Y%m%d")
+    except ValueError: raise E("日期无效")
+    return s
 
-def save(tasks: list[dict]) -> None:
-    """Replace the whole list. The pipe has no per-item write, so always merge first."""
-    reply = _request("REPLACE\n" + _serialize(tasks))
-    if not reply.startswith("OK\n"):
-        raise PipeError("service rejected the update: %r" % reply[:120])
-    sync_shadow(tasks)
+def tim(s):
+    s=(s or "").replace("：",":").strip()
+    if not s: return ""
+    if not re.fullmatch(r"\d{1,2}:\d{2}(-\d{1,2}:\d{2})?",s): raise E("时间必须类似 09:30 或 09:30-10:15")
+    for p in s.split("-"):
+        h,m=map(int,p.split(":"))
+        if h>23 or m>59: raise E("时间无效")
+    return s
 
+def cats(mid):
+    raw=get(mid,CATS)
+    if not raw: return DEFAULT_CATS
+    out=[]
+    for line in raw.splitlines():
+        c=[unesc(x) for x in line.split("\t")]
+        if len(c)==3 and c[0] and c[1] and re.fullmatch(r"#[0-9A-Fa-f]{6}",c[2]): out.append(dict(id=c[0],name=c[1],hex=c[2].upper()))
+    return out or DEFAULT_CATS
 
-def sync_shadow(tasks: list[dict]) -> None:
-    """Mirror the list into the mod's fallback copy.
+def cat(mid,x):
+    ids={c["id"] for c in cats(mid)}
+    if x not in ids: raise E("未知分类 %s；可用：%s"%(x,", ".join(sorted(ids))))
+    return x
 
-    The mod keeps its own copy for when the pipe is unreachable. If the two sides
-    disagree, the tray calendar shows stale tasks, so best-effort mirror after
-    every write. Missing registry key (another mod id, no Windhawk) is not fatal.
-    """
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SHADOW_KEY, 0,
-                            winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, SHADOW_VALUE, 0, winreg.REG_SZ, _serialize(tasks))
-    except (ImportError, OSError):
-        pass
-
-
-# ------------------------------------------------------------------------ helpers
-def fmt_day(day: str) -> str:
-    return "%s-%s-%s" % (day[:4], day[4:6], day[6:8])
-
-
-def pick(tasks: list[dict], task_id: str | None, match: str | None) -> dict:
-    if task_id:
-        want = task_id.strip("{}").upper()
-        hits = [t for t in tasks if t["id"].upper() == want]
-    else:
-        needle = (match or "").lower()
-        hits = [t for t in tasks if needle and needle in t["title"].lower()]
-    if len(hits) != 1:
-        raise SystemExit("matched %d tasks; need exactly one" % len(hits))
+def pick(tasks,match,on=None):
+    q=match.casefold().strip(); hits=[(i,t) for i,t in enumerate(tasks) if (not on or t["day"]==on) and q in t["title"].casefold()]
+    if len(hits)!=1: raise E("匹配到 %d 条待办；请使用更具体的 --match%s"%(len(hits)," 或 --on YYYYMMDD" if not on else ""))
     return hits[0]
 
+def show(t,j=False):
+    if j: print(json.dumps(t,ensure_ascii=False,indent=2)); return
+    print("[%s] %s%s  %s  (%s)"%("✓" if t["done"] else " ",t["day"],(" "+t["time"]) if t.get("time") else "",t["title"],t["category"]))
 
-def normalize_day(value: str | None) -> str:
-    if not value:
-        return datetime.date.today().strftime("%Y%m%d")
-    if not re.fullmatch(r"\d{8}", value):
-        raise SystemExit("--day must be YYYYMMDD")
-    return value
-
-
-def normalize_time(value: str | None) -> str:
-    text = (value or "").replace("：", ":").strip()
-    if text and not re.fullmatch(r"\d{1,2}:\d{2}(-\d{1,2}:\d{2})?", text):
-        raise SystemExit("--time must look like 14:00 or 14:00-15:30")
-    return text
-
-
-# ----------------------------------------------------------------------- commands
-def cmd_list(args) -> int:
-    tasks = load()
-    if args.day:
-        tasks = [t for t in tasks if t["day"] == args.day]
-    if args.pending:
-        tasks = [t for t in tasks if not t["done"]]
-    tasks.sort(key=lambda t: (t["day"], t["time"]))
-    if args.json:
-        print(json.dumps(tasks, ensure_ascii=False, indent=2))
-        return 0
-    if not tasks:
-        print("(no tasks)")
-        return 0
-    for t in tasks:
-        when = fmt_day(t["day"]) + ((" " + t["time"]) if t["time"] else "")
-        if t["remind"] < 0:
-            remind = ""
-        elif t["remind"] == 0:
-            remind = "  [remind on time]"
-        else:
-            remind = "  [remind %d min before]" % t["remind"]
-        print("%s %s  %s  (%s)%s  id=%s" % (
-            "x" if t["done"] else " ", when, t["title"], t["category"], remind, t["id"]))
-    return 0
-
-
-def cmd_add(args) -> int:
-    tasks = load()
-    task = {
-        "id": str(uuid.uuid4()).upper(),
-        "day": normalize_day(args.day),
-        "done": False,
-        "category": args.category or "work",
-        "title": args.title,
-        "time": normalize_time(args.time),
-        "location": args.location or "",
-        "url": args.url or "",
-        "notes": args.notes or "",
-        "remind": int(args.remind) if args.remind is not None else -1,
-    }
-    tasks.append(task)
-    save(tasks)
-    print(json.dumps(task, ensure_ascii=False) if args.json
-          else "added %s  %s %s  id=%s" % (fmt_day(task["day"]), task["time"],
-                                           task["title"], task["id"]))
-    return 0
-
-
-def cmd_edit(args) -> int:
-    tasks = load()
-    task = pick(tasks, args.id, args.match)
-    if args.title:
-        task["title"] = args.title
-    if args.day:
-        task["day"] = normalize_day(args.day)
-    if args.time is not None:
-        task["time"] = normalize_time(args.time)
-    if args.category:
-        task["category"] = args.category
-    if args.notes is not None:
-        task["notes"] = args.notes
-    if args.remind is not None:
-        task["remind"] = int(args.remind)
-    save(tasks)
-    print(json.dumps(task, ensure_ascii=False) if args.json
-          else "updated %s  %s %s" % (fmt_day(task["day"]), task["time"], task["title"]))
-    return 0
-
-
-def cmd_done(args) -> int:
-    tasks = load()
-    task = pick(tasks, args.id, args.match)
-    task["done"] = not args.undo
-    save(tasks)
-    print("%s %s" % ("reopened" if args.undo else "completed", task["title"]))
-    return 0
-
-
-def cmd_rm(args) -> int:
-    tasks = load()
-    task = pick(tasks, args.id, args.match)
-    save([t for t in tasks if t["id"] != task["id"]])
-    print("removed %s" % task["title"])
-    return 0
-
-
-def cmd_doctor(args) -> int:
-    checks, ok = [], True
-
-    def report(name, good, detail=""):
-        nonlocal ok
-        ok = ok and good
-        checks.append({"check": name, "ok": good, "detail": detail})
-
-    try:
-        tasks = load()
-        report("pipe", True, "%d task(s) readable" % len(tasks))
-    except Exception as exc:  # noqa: BLE001 - doctor reports, never raises
-        tasks = []
-        report("pipe", False, str(exc))
-
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SHADOW_KEY, 0, winreg.KEY_READ):
-            report("mod storage", True, SHADOW_KEY)
-    except (ImportError, OSError) as exc:
-        report("mod storage", False, "%s (%s)" % (SHADOW_KEY, exc))
-
-    report("python", sys.version_info >= (3, 8), sys.version.split()[0])
-    report("platform", sys.platform == "win32", sys.platform)
-
-    if args.json:
-        print(json.dumps({"ok": ok, "checks": checks}, ensure_ascii=False, indent=2))
+def show_json(x,j):
+    if j: print(json.dumps(x,ensure_ascii=False,indent=2))
     else:
-        for c in checks:
-            print("[%s] %-12s %s" % ("ok" if c["ok"] else "!!", c["check"], c["detail"]))
-        print("\nready" if ok else "\nnot ready: fix the checks marked !!")
-    return 0 if ok else 1
+        for k,v in x.items(): print(f"{k}: {v}")
 
+def doctor(a):
+    mid=mod(); _,ts,_=load(mid)
+    try: mod(True); writable=True
+    except E: writable=False
+    show_json(dict(ok=True,mod_id=mid,storage="HKLM\\"+path(mid),task_count=len(ts),writable=writable),a.json); return 0
 
-def main() -> int:
-    parser = argparse.ArgumentParser(prog="calctl", description=__doc__.splitlines()[0])
-    sub = parser.add_subparsers(dest="cmd", required=True)
+def ls(a):
+    _,ts,_=load()
+    if a.day: ts=[t for t in ts if t["day"]==day(a.day)]
+    if a.pending: ts=[t for t in ts if not t["done"]]
+    ts.sort(key=lambda t:(t["day"],t["time"],t["title"].casefold()))
+    if a.json: print(json.dumps(ts,ensure_ascii=False,indent=2))
+    elif not ts: print("(没有待办)")
+    else:
+        for t in ts: show(t)
+    return 0
 
-    p = sub.add_parser("list", help="list tasks")
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--day", help="only this day (YYYYMMDD)")
-    p.add_argument("--pending", action="store_true", help="hide completed tasks")
-    p.set_defaults(func=cmd_list)
+def categories(a):
+    cs=cats(mod())
+    if a.json: print(json.dumps(cs,ensure_ascii=False,indent=2))
+    else:
+        for c in cs: print(f"{c['id']}\t{c['name']}\t{c['hex']}")
+    return 0
 
-    p = sub.add_parser("add", help="add a task")
-    p.add_argument("--title", required=True)
-    p.add_argument("--day", help="YYYYMMDD, defaults to today")
-    p.add_argument("--time", help="14:00 or 14:00-15:30")
-    p.add_argument("--category", default="work")
-    p.add_argument("--notes")
-    p.add_argument("--location")
-    p.add_argument("--url")
-    p.add_argument("--remind", help="remind N minutes before the time")
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(func=cmd_add)
+def add(a):
+    mid=mod(True); _,ts,raw=load(mid); title=a.title.strip()
+    if not title: raise E("标题不能为空")
+    t=dict(day=day(a.day),done=False,category=cat(mid,a.category),title=title,time=tim(a.time),location=a.location or "",url=a.url or "",notes=a.notes or "")
+    ts.append(t); save(mid,ts,raw); show(t,a.json); return 0
 
-    p = sub.add_parser("edit", help="change an existing task")
-    p.add_argument("--id")
-    p.add_argument("--match", help="unique substring of the title")
-    p.add_argument("--title")
-    p.add_argument("--day")
-    p.add_argument("--time")
-    p.add_argument("--category")
-    p.add_argument("--notes")
-    p.add_argument("--remind")
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(func=cmd_edit)
+def edit(a):
+    mid=mod(True); _,ts,raw=load(mid); i,t=pick(ts,a.match,day(a.on) if a.on else None); u=dict(t)
+    for k in ("title","location","url","notes"):
+        v=getattr(a,k)
+        if v is not None: u[k]=v.strip() if k=="title" else v
+    if not u["title"]: raise E("标题不能为空")
+    if a.day is not None: u["day"]=day(a.day)
+    if a.time is not None: u["time"]=tim(a.time)
+    if a.category is not None: u["category"]=cat(mid,a.category)
+    ts[i]=u; save(mid,ts,raw); show(u,a.json); return 0
 
-    p = sub.add_parser("done", help="mark done")
-    p.add_argument("--id")
-    p.add_argument("--match")
-    p.add_argument("--undo", action="store_true", help="reopen instead")
-    p.set_defaults(func=cmd_done)
+def done(a):
+    mid=mod(True); _,ts,raw=load(mid); i,t=pick(ts,a.match,day(a.on) if a.on else None); t=dict(t); t["done"]=not a.undo; ts[i]=t; save(mid,ts,raw); show(t,a.json); return 0
 
-    p = sub.add_parser("rm", help="delete a task")
-    p.add_argument("--id")
-    p.add_argument("--match")
-    p.set_defaults(func=cmd_rm)
+def rm(a):
+    mid=mod(True); _,ts,raw=load(mid); i,t=pick(ts,a.match,day(a.on) if a.on else None); del ts[i]; save(mid,ts,raw); show_json({"deleted":t},a.json); return 0
 
-    p = sub.add_parser("doctor", help="check that everything is wired up")
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(func=cmd_doctor)
+def parser():
+    p=argparse.ArgumentParser(description="管理 Native Calendar Todo 本地待办"); s=p.add_subparsers(required=True)
+    q=s.add_parser("doctor"); q.add_argument("--json",action="store_true"); q.set_defaults(f=doctor)
+    q=s.add_parser("list"); q.add_argument("--day"); q.add_argument("--pending",action="store_true"); q.add_argument("--json",action="store_true"); q.set_defaults(f=ls)
+    q=s.add_parser("categories"); q.add_argument("--json",action="store_true"); q.set_defaults(f=categories)
+    q=s.add_parser("add"); q.add_argument("--title",required=True); q.add_argument("--day",required=True); q.add_argument("--time",default=""); q.add_argument("--category",default="work"); q.add_argument("--location",default=""); q.add_argument("--url",default=""); q.add_argument("--notes",default=""); q.add_argument("--json",action="store_true"); q.set_defaults(f=add)
+    q=s.add_parser("edit"); q.add_argument("--match",required=True); q.add_argument("--on"); q.add_argument("--title"); q.add_argument("--day"); q.add_argument("--time"); q.add_argument("--category"); q.add_argument("--location"); q.add_argument("--url"); q.add_argument("--notes"); q.add_argument("--json",action="store_true"); q.set_defaults(f=edit)
+    q=s.add_parser("done"); q.add_argument("--match",required=True); q.add_argument("--on"); q.add_argument("--undo",action="store_true"); q.add_argument("--json",action="store_true"); q.set_defaults(f=done)
+    q=s.add_parser("rm"); q.add_argument("--match",required=True); q.add_argument("--on"); q.add_argument("--json",action="store_true"); q.set_defaults(f=rm)
+    return p
 
-    args = parser.parse_args()
+def main():
     try:
-        return args.func(args)
-    except PipeError as exc:
-        print("error: %s" % exc, file=sys.stderr)
-        print("run `python calctl.py doctor` for a full check", file=sys.stderr)
-        return 2
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        a=parser().parse_args(); return a.f(a)
+    except E as e: print("ERROR:",e,file=sys.stderr); return 2
+    except OSError as e: print("ERROR: Windows/注册表操作失败：",e,file=sys.stderr); return 2
+if __name__=="__main__": raise SystemExit(main())
