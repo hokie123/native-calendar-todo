@@ -1,0 +1,44 @@
+name: Verify skill bundle
+
+on:
+  push:
+    branches: [main, improve-agent-skill]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            'install.ps1',
+            'skills/native-calendar-todo/scripts/bootstrap.ps1'
+          )
+          foreach ($file in $files) {
+            $text = Get-Content -LiteralPath $file -Raw
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_ }
+              throw "PowerShell parse failed: $file"
+            }
+          }
+
+      - name: Check bundled mod source is in sync
+        shell: powershell
+        run: |
+          $root = (Get-FileHash 'native-calendar-todo.wh.cpp' -Algorithm SHA256).Hash
+          $asset = (Get-FileHash 'skills/native-calendar-todo/assets/win11-native-todo-calendar.wh.cpp' -Algorithm SHA256).Hash
+          if ($root -ne $asset) {
+            throw 'Bundled skill mod source is out of sync with native-calendar-todo.wh.cpp'
+          }
+
+      - name: Compile Python client
+        shell: powershell
+        run: python -m py_compile skills/native-calendar-todo/scripts/calctl.py
